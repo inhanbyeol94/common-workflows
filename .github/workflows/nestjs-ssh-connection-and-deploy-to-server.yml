@@ -1,0 +1,124 @@
+name: Server Deploy
+
+on:
+  workflow_call:
+    inputs:
+      container-uri:
+        required: true
+        type: string
+      node-env:
+        required: true
+        type: string
+    secrets:
+      DEV_SSH_HOST:
+        required: true
+      DEV_SSH_PORT:
+        required: true
+      DEV_SSH_USER:
+        required: true
+      DEV_SSH_PASSWORD:
+        required: true
+      PROD_SSH_HOST:
+        required: false
+      PROD_SSH_PORT:
+        required: false
+      PROD_SSH_USER:
+        required: false
+      PROD_SSH_PASSWORD:
+        required: false
+
+jobs:
+  ssh-connection-and-deploy-to-server:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Convert Repository to Lowercase
+        id: repo_to_lower
+        run: |
+          echo "REPO_NAME=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+          GITHUB_REPO="${REPO_NAME#*/}"
+          echo "github_repo=${GITHUB_REPO}" >> $GITHUB_ENV
+
+      - name: Get Repository
+        id: github_repo
+        run: |
+          GITHUB_REPO="${REPO_NAME#*/}"
+          echo "github_repo=${GITHUB_REPO}" >> $GITHUB_ENV
+
+      - name: Set Branch Name
+        id: branch_name
+        run: |
+          echo "branch_name=${GITHUB_REF#refs/heads/}" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v3.3.0
+
+      - name: Set SSH secrets based on node-env
+        id: set-secrets
+        run: |
+          if [ "${{ inputs['node-env'] }}" == "prod" ]; then
+            echo "::set-output name=SSH_HOST::${{ secrets.PROD_SSH_HOST }}"
+            echo "::set-output name=SSH_PORT::${{ secrets.PROD_SSH_PORT }}"
+            echo "::set-output name=SSH_USER::${{ secrets.PROD_SSH_USER }}"
+            echo "::set-output name=SSH_PASSWORD::${{ secrets.PROD_SSH_PASSWORD }}"
+            echo "::set-output name=SSH_NODE_ENV::production"
+          else
+            echo "::set-output name=SSH_HOST::${{ secrets.DEV_SSH_HOST }}"
+            echo "::set-output name=SSH_PORT::${{ secrets.DEV_SSH_PORT }}"
+            echo "::set-output name=SSH_USER::${{ secrets.DEV_SSH_USER }}"
+            echo "::set-output name=SSH_PASSWORD::${{ secrets.DEV_SSH_PASSWORD }}"
+            echo "::set-output name=SSH_NODE_ENV::development"
+          fi
+
+      - name: SSH Connection and Deploy to Server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ steps.set-secrets.outputs.SSH_HOST }}
+          username: ${{ steps.set-secrets.outputs.SSH_USER }}
+          password: ${{ steps.set-secrets.outputs.SSH_PASSWORD }}
+          port: ${{ steps.set-secrets.outputs.SSH_PORT }}
+          script: |
+            # Step1 Check if the nginx conf file exists
+            FILE_NAME="${{ env.github_repo }}.conf"
+            CONFIG_TEMPLATE="/home/docker-manager/nginx_configs/config_form.txt"
+            TARGET_FILE="/home/docker-manager/nginx_configs/$FILE_NAME"
+            if [ ! -f "$TARGET_FILE" ]; then
+            echo "컨테이너의 프록시 라우팅 파일이 구성되어있지 않아 새로 생성합니다."
+            CONTAINER_URI="${{ inputs.container-uri }}"
+            sed -e "s|URL|$CONTAINER_URI|g" -e "s|CONTAINER|${{ env.github_repo }}|g" "$CONFIG_TEMPLATE" > "$TARGET_FILE"
+            fi
+            
+            # Step2 Prisma Migrate Deploy and Container Deploy
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker pull ghcr.io/${{ env.REPO_NAME }}/prisma-migrate-deploy:${{ env.branch_name }}
+            docker run --name ${{ env.github_repo}}-prisma-migrate-deploy --env-file /home/docker-manager/env/${{ env.github_repo }}.env --rm ghcr.io/${{ env.REPO_NAME }}/prisma-migrate-deploy:${{ env.branch_name }} || exit 1
+            
+            # Step3 Container Deploy
+            docker pull ghcr.io/${{ env.REPO_NAME }}/api:${{ env.branch_name }}
+            docker rm -f ${{ env.github_repo }} || true
+            docker run -d \
+            --name ${{ env.github_repo }} \
+            -v /home/docker-manager/logs/${{ env.github_repo }}:/logs \
+            --network router \
+            --restart=unless-stopped \
+            --env-file /home/docker-manager/env/${{ env.github_repo }}.env \
+            -e NODE_ENV=${{ steps.set-secrets.outputs.SSH_NODE_ENV }} \
+            ghcr.io/${{ env.REPO_NAME }}/api:${{ env.branch_name }}
+            
+            # Step4 Prune Docker Images
+            docker rmi ghcr.io/${{ env.REPO_NAME }}/prisma-migrate-deploy:${{ env.branch_name }}
+            docker image prune -f
+            docker logout ghcr.io
+            
+            # docker restart main_nginx
+            echo "Checking main_nginx configuration..."
+            result=$(docker exec main_nginx nginx -t 2>&1)
+            status=$?
+            echo "$result"
+            
+            if [ $status -eq 0 ]; then
+              echo "✅ Nginx configuration is valid"
+              docker exec main_nginx nginx -s reload
+            else
+              echo "❌ Nginx configuration check failed"
+              echo "Checking container status..."
+              exit 1
+            fi
